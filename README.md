@@ -1,3 +1,6 @@
+# ABOUT THIS FORK
+This fork loads `large-v3-turbo` as soon as the server starts, instead of waiting for the first connection. It also adds additional logging to the server, and fixes some typing issues.
+
 # WhisperLive
 
 <h2 align="center">
