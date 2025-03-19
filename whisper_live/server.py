@@ -4,6 +4,7 @@ import threading
 import json
 import functools
 import logging
+import math
 from enum import Enum
 from typing import List, Optional
 
@@ -147,10 +148,85 @@ class TranscriptionServer:
     RATE = 16000
 
     def __init__(self):
-        self.client_manager = None
+        self.client_manager = ClientManager()
         self.no_voice_activity_chunks = 0
         self.use_vad = True
         self.single_model = False
+        self.backend = BackendType.FASTER_WHISPER  # Default backend
+        self.preloaded_model = False
+
+    def preload_model(self, backend, faster_whisper_custom_model_path=None, whisper_tensorrt_path=None, trt_multilingual=False, model_name="large-v3-turbo"):
+        """
+        Preload the model at server startup to avoid delay on first connection.
+        
+        Args:
+            backend (BackendType): The backend to use (faster_whisper or tensorrt)
+            faster_whisper_custom_model_path (str, optional): Path to custom faster whisper model.
+            whisper_tensorrt_path (str, optional): Path to tensorrt model.
+            trt_multilingual (bool, optional): Whether to use multilingual model (for TensorRT).
+            model_name (str, optional): Name of the model to preload for faster_whisper. Default is "large-v3-turbo".
+        """
+        self.backend = backend
+        if self.backend.is_faster_whisper():
+            try:
+                logging.info(f"Preloading faster_whisper model: {model_name}")
+                
+                # Model path handling
+                model_path = model_name
+                if faster_whisper_custom_model_path is not None and os.path.exists(faster_whisper_custom_model_path):
+                    logging.info(f"Using custom model path: {faster_whisper_custom_model_path}")
+                    model_path = faster_whisper_custom_model_path
+                
+                # Determine compute type
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                compute_type = "int8"
+                if device == "cuda":
+                    major, _ = torch.cuda.get_device_capability(device)
+                    compute_type = "float16" if major >= 7 else "float32"
+                
+                logging.info(f"Using Device={device} with precision {compute_type}")
+                
+                # Create the model
+                from whisper_live.transcriber import WhisperModel
+                ServeClientFasterWhisper.SINGLE_MODEL = WhisperModel(
+                    model_path,
+                    device=device,
+                    compute_type=compute_type,
+                    local_files_only=False,
+                )
+                logging.info("Faster whisper model preloaded successfully!")
+                self.preloaded_model = True
+            except Exception as e:
+                logging.error(f"Failed to preload faster_whisper model: {e}")
+        
+        elif self.backend.is_tensorrt():
+            try:
+                logging.info("Preloading TensorRT model")
+                if whisper_tensorrt_path is None:
+                    logging.error("TensorRT model path not provided, can't preload")
+                    return
+                
+                # Preload TensorRT model
+                from whisper_live.transcriber_tensorrt import WhisperTRTLLM
+                ServeClientTensorRT.SINGLE_MODEL = WhisperTRTLLM(
+                    whisper_tensorrt_path,
+                    assets_dir="assets",
+                    device="cuda",
+                    is_multilingual=trt_multilingual,
+                    language="en",
+                    task="transcribe"
+                )
+                
+                # Warmup
+                logging.info("Warming up TensorRT engine...")
+                mel, _ = ServeClientTensorRT.SINGLE_MODEL.log_mel_spectrogram("assets/jfk.flac")
+                for i in range(10):  # 10 warmup steps
+                    ServeClientTensorRT.SINGLE_MODEL.transcribe(mel)
+                
+                logging.info("TensorRT model preloaded and warmed up successfully!")
+                self.preloaded_model = True
+            except Exception as e:
+                logging.error(f"Failed to preload TensorRT model: {e}")
 
     def initialize_client(
         self, websocket, options, faster_whisper_custom_model_path,
@@ -257,6 +333,9 @@ class TranscriptionServer:
     def process_audio_frames(self, websocket):
         frame_np = self.get_audio_from_websocket(websocket)
         client = self.client_manager.get_client(websocket)
+        if client is False:
+            return False
+            
         if frame_np is False:
             if self.backend.is_tensorrt():
                 client.set_eos(True)
@@ -342,12 +421,20 @@ class TranscriptionServer:
         if whisper_tensorrt_path is not None and not os.path.exists(whisper_tensorrt_path):
             raise ValueError(f"TensorRT model '{whisper_tensorrt_path}' is not a valid path.")
         if single_model:
-            if faster_whisper_custom_model_path or whisper_tensorrt_path:
-                logging.info("Custom model option was provided. Switching to single model mode.")
+            if faster_whisper_custom_model_path or whisper_tensorrt_path or backend == "faster_whisper":
+                logging.info("Single model mode enabled. Preloading model...")
                 self.single_model = True
-                # TODO: load model initially
+                if not BackendType.is_valid(backend):
+                    raise ValueError(f"{backend} is not a valid backend type. Choose backend from {BackendType.valid_types()}")
+                self.preload_model(
+                    BackendType(backend),
+                    faster_whisper_custom_model_path=faster_whisper_custom_model_path,
+                    whisper_tensorrt_path=whisper_tensorrt_path,
+                    trt_multilingual=trt_multilingual,
+                    model_name="large-v3-turbo"
+                )
             else:
-                logging.info("Single model mode currently only works with custom models.")
+                logging.info("Single model mode currently only works with custom models or faster_whisper backend.")
         if not BackendType.is_valid(backend):
             raise ValueError(f"{backend} is not a valid backend type. Choose backend from {BackendType.valid_types()}")
         with serve(
@@ -387,7 +474,7 @@ class TranscriptionServer:
             self.no_voice_activity_chunks += 1
             if self.no_voice_activity_chunks > 3:
                 client = self.client_manager.get_client(websocket)
-                if not client.eos:
+                if client is not False and not client.eos:
                     client.set_eos(True)
                 time.sleep(0.1)    # Sleep 100m; wait some voice activity.
             return False
@@ -414,7 +501,7 @@ class ServeClientBase(object):
         self.websocket = websocket
         self.frames = b""
         self.timestamp_offset = 0.0
-        self.frames_np = None
+        self.frames_np = np.array([], dtype=np.float32)
         self.frames_offset = 0.0
         self.text = []
         self.current_out = ''
@@ -426,21 +513,56 @@ class ServeClientBase(object):
         self.add_pause_thresh = 3       # add a blank to segment list as a pause(no speech) for 3 seconds
         self.transcript = []
         self.send_last_n_segments = 10
-
+        
+        # Add attributes needed by derived classes
+        self.eos = False
+        
         # text formatting
         self.pick_previous_segments = 2
 
         # threading
         self.lock = threading.Lock()
+        
+        # Track already sent completed segments
+        self.sent_completed_segments = set()
 
     def speech_to_text(self):
         raise NotImplementedError
 
-    def transcribe_audio(self):
+    def transcribe_audio(self, audio_input):
+        """
+        Transcribe audio input.
+        
+        Args:
+            audio_input: Audio data to transcribe
+        """
         raise NotImplementedError
 
-    def handle_transcription_output(self):
+    def handle_transcription_output(self, transcription_result, audio_duration):
+        """
+        Handle the transcription output, updating the transcript and sending data to the client.
+        
+        Args:
+            transcription_result: The result from transcription (can be segments or text)
+            audio_duration (float): Duration of the transcribed audio chunk.
+        """
         raise NotImplementedError
+        
+    def update_timestamp_offset(self, segment, duration):
+        """
+        Update timestamp offset and transcript.
+
+        Args:
+            segment (str): Last transcribed audio from the whisper model.
+            duration (float): Duration of the last audio chunk.
+        """
+        if not len(self.transcript):
+            self.transcript.append({"text": segment + " ", "confidence": 0.0})  # TensorRT doesn't provide confidence directly
+        elif self.transcript[-1]["text"].strip() != segment:
+            self.transcript.append({"text": segment + " ", "confidence": 0.0})  # TensorRT doesn't provide confidence directly
+        
+        with self.lock:
+            self.timestamp_offset += duration
 
     def add_frames(self, frame_np):
         """
@@ -459,7 +581,7 @@ class ServeClientBase(object):
 
         """
         self.lock.acquire()
-        if self.frames_np is not None and self.frames_np.shape[0] > 45*self.RATE:
+        if self.frames_np.shape[0] > 45*self.RATE:
             self.frames_offset += 30.0
             self.frames_np = self.frames_np[int(30*self.RATE):]
             # check timestamp offset(should be >= self.frame_offset)
@@ -467,7 +589,7 @@ class ServeClientBase(object):
             # and is less than frame_offset
             if self.timestamp_offset < self.frames_offset:
                 self.timestamp_offset = self.frames_offset
-        if self.frames_np is None:
+        if self.frames_np.shape[0] == 0:
             self.frames_np = frame_np.copy()
         else:
             self.frames_np = np.concatenate((self.frames_np, frame_np), axis=0)
@@ -508,10 +630,8 @@ class ServeClientBase(object):
         """
         Prepares the segments of transcribed text to be sent to the client.
 
-        This method compiles the recent segments of transcribed text, ensuring that only the
-        specified number of the most recent segments are included. It also appends the most
-        recent segment of text if provided (which is considered incomplete because of the possibility
-        of the last word being truncated in the audio chunk).
+        This method compiles only segments that haven't been sent before or are incomplete.
+        Once a segment is marked as completed and sent, it won't be included in future responses.
 
         Args:
             last_segment (str, optional): The most recent segment of transcribed text to be added
@@ -521,12 +641,24 @@ class ServeClientBase(object):
             list: A list of transcribed text segments to be sent to the client.
         """
         segments = []
-        if len(self.transcript) >= self.send_last_n_segments:
-            segments = self.transcript[-self.send_last_n_segments:].copy()
-        else:
-            segments = self.transcript.copy()
+        
+        # Get recent segments from transcript that haven't been sent yet or aren't completed
+        for segment in self.transcript:
+            segment_id = f"{segment.get('start', '')}-{segment.get('end', '')}"
+            if not segment.get('completed', False) or segment_id not in self.sent_completed_segments:
+                segments.append(segment)
+                # Mark completed segments as sent
+                if segment.get('completed', False):
+                    self.sent_completed_segments.add(segment_id)
+        
+        # Add the latest incomplete segment if provided
         if last_segment is not None:
-            segments = segments + [last_segment]
+            segments.append(last_segment)
+            
+        # Apply the limit to avoid sending too many segments
+        if len(segments) > self.send_last_n_segments:
+            segments = segments[-self.send_last_n_segments:]
+            
         return segments
 
     def get_audio_chunk_duration(self, input_bytes):
@@ -552,12 +684,12 @@ class ServeClientBase(object):
             segments (list): A list of transcription segments to be sent to the client.
         """
         try:
-            self.websocket.send(
-                json.dumps({
-                    "uid": self.client_uid,
-                    "segments": segments,
-                })
-            )
+            response = {
+                "uid": self.client_uid,
+                "segments": segments,
+            }
+            logging.info(f"Sending response to client {self.client_uid}: {json.dumps(response, indent=2)}")
+            self.websocket.send(json.dumps(response))
         except Exception as e:
             logging.error(f"[ERROR]: Sending data to client: {e}")
 
@@ -615,11 +747,13 @@ class ServeClientTensorRT(ServeClientBase):
         self.eos = False
 
         if single_model:
-            if ServeClientTensorRT.SINGLE_MODEL is None:
+            if ServeClientTensorRT.SINGLE_MODEL is not None:
+                logging.info("Using preloaded TensorRT model")
+                self.transcriber = ServeClientTensorRT.SINGLE_MODEL
+            else:
+                logging.info("TensorRT single model was requested but not preloaded. Creating model...")
                 self.create_model(model, multilingual)
                 ServeClientTensorRT.SINGLE_MODEL = self.transcriber
-            else:
-                self.transcriber = ServeClientTensorRT.SINGLE_MODEL
         else:
             self.create_model(model, multilingual)
 
@@ -637,12 +771,15 @@ class ServeClientTensorRT(ServeClientBase):
         """
         Instantiates a new model, sets it as the transcriber and does warmup if desired.
         """
+        # Ensure language is never None
+        language = self.language if self.language is not None else "en"
+        
         self.transcriber = WhisperTRTLLM(
             model,
             assets_dir="assets",
             device="cuda",
             is_multilingual=multilingual,
-            language=self.language,
+            language=language,
             task=self.task
         )
         if warmup:
@@ -671,31 +808,40 @@ class ServeClientTensorRT(ServeClientBase):
         self.eos = eos
         self.lock.release()
 
-    def handle_transcription_output(self, last_segment, duration):
+    def handle_transcription_output(self, transcription_result, audio_duration):
         """
         Handle the transcription output, updating the transcript and sending data to the client.
 
         Args:
-            last_segment (str): The last segment from the whisper output which is considered to be incomplete because
+            transcription_result (str): The last segment from the whisper output which is considered to be incomplete because
                                 of the possibility of word being truncated.
-            duration (float): Duration of the transcribed audio chunk.
+            audio_duration (float): Duration of the transcribed audio chunk.
         """
-        segments = self.prepare_segments({"text": last_segment})
+        segments = self.prepare_segments({"text": transcription_result, "confidence": 0.0})  # TensorRT doesn't provide confidence directly
         self.send_transcription_to_client(segments)
         if self.eos:
-            self.update_timestamp_offset(last_segment, duration)
+            self.update_timestamp_offset(transcription_result, audio_duration)
 
-    def transcribe_audio(self, input_bytes):
+    def transcribe_audio(self, audio_input):
         """
-        Transcribe the audio chunk and send the results to the client.
+        Transcribes the provided audio sample using the configured transcriber instance.
+
+        If the language has not been set, it updates the session's language based on the transcription
+        information.
 
         Args:
-            input_bytes (np.array): The audio chunk to transcribe.
+            audio_input (np.array): The audio chunk to be transcribed. This should be a NumPy
+                                    array representing the audio data.
+
+        Returns:
+            The transcription result from the transcriber. The exact format of this result
+            depends on the implementation of the `transcriber.transcribe` method but typically
+            includes the transcribed text.
         """
         if ServeClientTensorRT.SINGLE_MODEL:
             ServeClientTensorRT.SINGLE_MODEL_LOCK.acquire()
-        logging.info(f"[WhisperTensorRT:] Processing audio with duration: {input_bytes.shape[0] / self.RATE}")
-        mel, duration = self.transcriber.log_mel_spectrogram(input_bytes)
+        logging.info(f"[WhisperTensorRT:] Processing audio with duration: {audio_input.shape[0] / self.RATE}")
+        mel, duration = self.transcriber.log_mel_spectrogram(audio_input)
         last_segment = self.transcriber.transcribe(
             mel,
             text_prefix=f"<|startoftranscript|><|{self.language}|><|{self.task}|><|notimestamps|>"
@@ -704,22 +850,6 @@ class ServeClientTensorRT(ServeClientBase):
             ServeClientTensorRT.SINGLE_MODEL_LOCK.release()
         if last_segment:
             self.handle_transcription_output(last_segment, duration)
-
-    def update_timestamp_offset(self, last_segment, duration):
-        """
-        Update timestamp offset and transcript.
-
-        Args:
-            last_segment (str): Last transcribed audio from the whisper model.
-            duration (float): Duration of the last audio chunk.
-        """
-        if not len(self.transcript):
-            self.transcript.append({"text": last_segment + " "})
-        elif self.transcript[-1]["text"].strip() != last_segment:
-            self.transcript.append({"text": last_segment + " "})
-        
-        with self.lock:
-            self.timestamp_offset += duration
 
     def speech_to_text(self):
         """
@@ -743,7 +873,7 @@ class ServeClientTensorRT(ServeClientBase):
                 logging.info("Exiting speech to text thread")
                 break
 
-            if self.frames_np is None:
+            if self.frames_np.shape[0] == 0:
                 time.sleep(0.02)    # wait for any audio to arrive
                 continue
 
@@ -767,7 +897,7 @@ class ServeClientFasterWhisper(ServeClientBase):
     SINGLE_MODEL = None
     SINGLE_MODEL_LOCK = threading.Lock()
 
-    def __init__(self, websocket, task="transcribe", device=None, language=None, client_uid=None, model="small.en",
+    def __init__(self, websocket, task="transcribe", device=None, language=None, client_uid=None, model="large-v3-turbo",
                  initial_prompt=None, vad_parameters=None, use_vad=True, single_model=False):
         """
         Initialize a ServeClient instance.
@@ -785,7 +915,29 @@ class ServeClientFasterWhisper(ServeClientBase):
             initial_prompt (str, optional): Prompt for whisper inference. Defaults to None.
             single_model (bool, optional): Whether to instantiate a new model for each client connection. Defaults to False.
         """
-        super().__init__(client_uid, websocket)
+        self.device = device or "cuda" if torch.cuda.is_available() else "cpu"
+        # Set compute type based on device capabilities
+        if self.device == "cuda":
+            major, _ = torch.cuda.get_device_capability(self.device)
+            self.compute_type = "float16" if major >= 7 else "float32"
+        else:
+            self.compute_type = "int8"
+            
+        ServeClientBase.__init__(self, client_uid, websocket)
+        self.language = language
+        self.task = task
+        self.model_size = model
+        self.same_output_threshold = 3
+        self.same_output_count = 0
+        self.end_time_for_same_output = None
+        self.lock = threading.Lock()
+        self.transcript = []
+        self.text = []
+        self.no_speech_thresh = 0.6
+        self.prev_out = ''
+        self.current_out = ''
+        self.current_segment_avg_logprob = None  # Store the latest segment's avg_logprob
+        self.use_vad = use_vad
         self.model_sizes = [
             "tiny", "tiny.en", "base", "base.en", "small", "small.en",
             "medium", "medium.en", "large-v2", "large-v3", "distil-small.en",
@@ -795,33 +947,31 @@ class ServeClientFasterWhisper(ServeClientBase):
 
         self.model_size_or_path = model
         self.language = "en" if self.model_size_or_path.endswith("en") else language
-        self.task = task
         self.initial_prompt = initial_prompt
         self.vad_parameters = vad_parameters or {"onset": 0.5}
         self.no_speech_thresh = 0.45
         self.same_output_threshold = 10
         self.end_time_for_same_output = None
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        if device == "cuda":
-            major, _ = torch.cuda.get_device_capability(device)
-            self.compute_type = "float16" if major >= 7 else "float32"
-        else:
-            self.compute_type = "int8"
+        # Add this to track the last sent segment
+        self.last_sent_segment = None
 
         if self.model_size_or_path is None:
             return
-        logging.info(f"Using Device={device} with precision {self.compute_type}")
+        logging.info(f"Using Device={self.device} with precision {self.compute_type}")
     
         try:
+            # Check if we should use the preloaded model
             if single_model:
-                if ServeClientFasterWhisper.SINGLE_MODEL is None:
-                    self.create_model(device)
-                    ServeClientFasterWhisper.SINGLE_MODEL = self.transcriber
-                else:
+                if ServeClientFasterWhisper.SINGLE_MODEL is not None:
+                    logging.info("Using preloaded single model")
                     self.transcriber = ServeClientFasterWhisper.SINGLE_MODEL
+                else:
+                    logging.info("Single model was requested but not preloaded. Creating model...")
+                    self.create_model(self.device)
+                    ServeClientFasterWhisper.SINGLE_MODEL = self.transcriber
             else:
-                self.create_model(device)
+                self.create_model(self.device)
         except Exception as e:
             logging.error(f"Failed to load model: {e}")
             self.websocket.send(json.dumps({
@@ -897,7 +1047,7 @@ class ServeClientFasterWhisper(ServeClientBase):
             self.websocket.send(json.dumps(
                 {"uid": self.client_uid, "language": self.language, "language_prob": info.language_probability}))
 
-    def transcribe_audio(self, input_sample):
+    def transcribe_audio(self, audio_input):
         """
         Transcribes the provided audio sample using the configured transcriber instance.
 
@@ -905,7 +1055,7 @@ class ServeClientFasterWhisper(ServeClientBase):
         information.
 
         Args:
-            input_sample (np.array): The audio chunk to be transcribed. This should be a NumPy
+            audio_input (np.array): The audio chunk to be transcribed. This should be a NumPy
                                     array representing the audio data.
 
         Returns:
@@ -916,7 +1066,7 @@ class ServeClientFasterWhisper(ServeClientBase):
         if ServeClientFasterWhisper.SINGLE_MODEL:
             ServeClientFasterWhisper.SINGLE_MODEL_LOCK.acquire()
         result, info = self.transcriber.transcribe(
-            input_sample,
+            audio_input,
             initial_prompt=self.initial_prompt,
             language=self.language,
             task=self.task,
@@ -947,6 +1097,8 @@ class ServeClientFasterWhisper(ServeClientBase):
         segments = []
         if self.t_start is None:
             self.t_start = time.time()
+            
+        # Only return incomplete segments that haven't been sent
         if time.time() - self.t_start < self.show_prev_out_thresh:
             segments = self.prepare_segments()
 
@@ -954,27 +1106,48 @@ class ServeClientFasterWhisper(ServeClientBase):
         if len(self.text) and self.text[-1] != '':
             if time.time() - self.t_start > self.add_pause_thresh:
                 self.text.append('')
+                
         return segments
 
-    def handle_transcription_output(self, result, duration):
+    def handle_transcription_output(self, transcription_result, audio_duration):
         """
         Handle the transcription output, updating the transcript and sending data to the client.
-
+        
         Args:
-            result (str): The result from whisper inference i.e. the list of segments.
-            duration (float): Duration of the transcribed audio chunk.
+            transcription_result: The result from whisper inference i.e. the list of segments.
+            audio_duration (float): Duration of the transcribed audio chunk.
         """
         segments = []
-        if len(result):
+        if len(transcription_result):
             self.t_start = None
-            last_segment = self.update_segments(result, duration)
+            last_segment = self.update_segments(transcription_result, audio_duration)
             segments = self.prepare_segments(last_segment)
         else:
             # show previous output if there is pause i.e. no output from whisper
             segments = self.get_previous_output()
 
+        # Only send if we have segments to send and they're different from the last sent ones
         if len(segments):
-            self.send_transcription_to_client(segments)
+            # Only send updates if there are new segments or changes to existing ones
+            if self.last_sent_segment is None or len(segments) != len(self.last_sent_segment):
+                self.send_transcription_to_client(segments)
+                self.last_sent_segment = segments.copy()
+            else:
+                # Check if any segment's content has changed
+                has_changes = False
+                for i, segment in enumerate(segments):
+                    if i >= len(self.last_sent_segment):
+                        has_changes = True
+                        break
+                    # Check if the text or completed status has changed
+                    if (segment.get('text', '') != self.last_sent_segment[i].get('text', '') or
+                        segment.get('completed', False) != self.last_sent_segment[i].get('completed', False)):
+                        has_changes = True
+                        break
+                
+                if has_changes:
+                    self.send_transcription_to_client(segments)
+                    self.last_sent_segment = segments.copy()
 
     def speech_to_text(self):
         """
@@ -998,7 +1171,7 @@ class ServeClientFasterWhisper(ServeClientBase):
                 logging.info("Exiting speech to text thread")
                 break
 
-            if self.frames_np is None:
+            if self.frames_np.shape[0] == 0:
                 continue
 
             self.clip_audio_if_no_valid_segment()
@@ -1021,7 +1194,7 @@ class ServeClientFasterWhisper(ServeClientBase):
                 logging.error(f"[ERROR]: Failed to transcribe audio chunk: {e}")
                 time.sleep(0.01)
 
-    def format_segment(self, start, end, text, completed=False):
+    def format_segment(self, start, end, text, completed=False, avg_logprob=None):
         """
         Formats a transcription segment with precise start and end times alongside the transcribed text.
 
@@ -1029,18 +1202,29 @@ class ServeClientFasterWhisper(ServeClientBase):
             start (float): The start time of the transcription segment in seconds.
             end (float): The end time of the transcription segment in seconds.
             text (str): The transcribed text corresponding to the segment.
+            completed (bool): Whether this segment is complete or may be updated.
+            avg_logprob (float, optional): The average log probability of tokens, serves as confidence score.
 
         Returns:
             dict: A dictionary representing the formatted transcription segment, including
-                'start' and 'end' times as strings with three decimal places and the 'text'
-                of the transcription.
+                'start' and 'end' times as strings with three decimal places, the 'text'
+                of the transcription, whether it's 'completed', and the confidence score (0-1).
         """
-        return {
+        segment = {
             'start': "{:.3f}".format(start),
             'end': "{:.3f}".format(end),
             'text': text,
             'completed': completed
         }
+        
+        # Include confidence score if available
+        if avg_logprob is not None:
+            # Convert log probability to a 0-1 confidence score using exp function
+            # Since log probabilities are <= 0, exp(log_prob) will be between 0 and 1
+            confidence = math.exp(avg_logprob)
+            segment['confidence'] = round(confidence, 4)  # Round to 4 decimal places for readability
+        
+        return segment
 
     def update_segments(self, segments, duration):
         """
@@ -1080,18 +1264,27 @@ class ServeClientFasterWhisper(ServeClientBase):
                 if s.no_speech_prob > self.no_speech_thresh:
                     continue
 
-                self.transcript.append(self.format_segment(start, end, text_, completed=True))
+                self.transcript.append(self.format_segment(
+                    start, 
+                    end, 
+                    text_, 
+                    completed=True,
+                    avg_logprob=s.avg_logprob
+                ))
                 offset = min(duration, s.end)
 
         # only process the last segment if it satisfies the no_speech_thresh
         if segments[-1].no_speech_prob <= self.no_speech_thresh:
             self.current_out += segments[-1].text
+            # Store the avg_logprob of the last segment for later use
+            self.current_segment_avg_logprob = segments[-1].avg_logprob
             with self.lock:
                 last_segment = self.format_segment(
                     self.timestamp_offset + segments[-1].start,
                     self.timestamp_offset + min(duration, segments[-1].end),
                     self.current_out,
-                    completed=False
+                    completed=False,
+                    avg_logprob=segments[-1].avg_logprob
                 )
 
         if self.current_out.strip() == self.prev_out.strip() and self.current_out != '':
@@ -1112,15 +1305,17 @@ class ServeClientFasterWhisper(ServeClientBase):
             if not len(self.text) or self.text[-1].strip().lower() != self.current_out.strip().lower():
                 self.text.append(self.current_out)
                 with self.lock:
+                    # Use the stored avg_logprob if available, otherwise use a default
+                    avg_logprob = self.current_segment_avg_logprob if self.current_segment_avg_logprob is not None else -1.0
                     self.transcript.append(self.format_segment(
                         self.timestamp_offset,
                         self.timestamp_offset + min(duration, self.end_time_for_same_output),
                         self.current_out,
-                        completed=True
+                        completed=True,
+                        avg_logprob=avg_logprob  # Use the actual avg_logprob
                     ))
             self.current_out = ''
             offset = min(duration, self.end_time_for_same_output)
-            self.same_output_count = 0
             last_segment = None
             self.end_time_for_same_output = None
         else:
