@@ -147,10 +147,85 @@ class TranscriptionServer:
     RATE = 16000
 
     def __init__(self):
-        self.client_manager = None
+        self.client_manager = ClientManager()
         self.no_voice_activity_chunks = 0
         self.use_vad = True
         self.single_model = False
+        self.backend = BackendType.FASTER_WHISPER  # Default backend
+        self.preloaded_model = False
+
+    def preload_model(self, backend, faster_whisper_custom_model_path=None, whisper_tensorrt_path=None, trt_multilingual=False, model_name="large-v3-turbo"):
+        """
+        Preload the model at server startup to avoid delay on first connection.
+        
+        Args:
+            backend (BackendType): The backend to use (faster_whisper or tensorrt)
+            faster_whisper_custom_model_path (str, optional): Path to custom faster whisper model.
+            whisper_tensorrt_path (str, optional): Path to tensorrt model.
+            trt_multilingual (bool, optional): Whether to use multilingual model (for TensorRT).
+            model_name (str, optional): Name of the model to preload for faster_whisper. Default is "large-v3-turbo".
+        """
+        self.backend = backend
+        if self.backend.is_faster_whisper():
+            try:
+                logging.info(f"Preloading faster_whisper model: {model_name}")
+                
+                # Model path handling
+                model_path = model_name
+                if faster_whisper_custom_model_path is not None and os.path.exists(faster_whisper_custom_model_path):
+                    logging.info(f"Using custom model path: {faster_whisper_custom_model_path}")
+                    model_path = faster_whisper_custom_model_path
+                
+                # Determine compute type
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                compute_type = "int8"
+                if device == "cuda":
+                    major, _ = torch.cuda.get_device_capability(device)
+                    compute_type = "float16" if major >= 7 else "float32"
+                
+                logging.info(f"Using Device={device} with precision {compute_type}")
+                
+                # Create the model
+                from whisper_live.transcriber import WhisperModel
+                ServeClientFasterWhisper.SINGLE_MODEL = WhisperModel(
+                    model_path,
+                    device=device,
+                    compute_type=compute_type,
+                    local_files_only=False,
+                )
+                logging.info("Faster whisper model preloaded successfully!")
+                self.preloaded_model = True
+            except Exception as e:
+                logging.error(f"Failed to preload faster_whisper model: {e}")
+        
+        elif self.backend.is_tensorrt():
+            try:
+                logging.info("Preloading TensorRT model")
+                if whisper_tensorrt_path is None:
+                    logging.error("TensorRT model path not provided, can't preload")
+                    return
+                
+                # Preload TensorRT model
+                from whisper_live.transcriber_tensorrt import WhisperTRTLLM
+                ServeClientTensorRT.SINGLE_MODEL = WhisperTRTLLM(
+                    whisper_tensorrt_path,
+                    assets_dir="assets",
+                    device="cuda",
+                    is_multilingual=trt_multilingual,
+                    language="en",
+                    task="transcribe"
+                )
+                
+                # Warmup
+                logging.info("Warming up TensorRT engine...")
+                mel, _ = ServeClientTensorRT.SINGLE_MODEL.log_mel_spectrogram("assets/jfk.flac")
+                for i in range(10):  # 10 warmup steps
+                    ServeClientTensorRT.SINGLE_MODEL.transcribe(mel)
+                
+                logging.info("TensorRT model preloaded and warmed up successfully!")
+                self.preloaded_model = True
+            except Exception as e:
+                logging.error(f"Failed to preload TensorRT model: {e}")
 
     def initialize_client(
         self, websocket, options, faster_whisper_custom_model_path,
@@ -342,12 +417,20 @@ class TranscriptionServer:
         if whisper_tensorrt_path is not None and not os.path.exists(whisper_tensorrt_path):
             raise ValueError(f"TensorRT model '{whisper_tensorrt_path}' is not a valid path.")
         if single_model:
-            if faster_whisper_custom_model_path or whisper_tensorrt_path:
-                logging.info("Custom model option was provided. Switching to single model mode.")
+            if faster_whisper_custom_model_path or whisper_tensorrt_path or backend == "faster_whisper":
+                logging.info("Single model mode enabled. Preloading model...")
                 self.single_model = True
-                # TODO: load model initially
+                if not BackendType.is_valid(backend):
+                    raise ValueError(f"{backend} is not a valid backend type. Choose backend from {BackendType.valid_types()}")
+                self.preload_model(
+                    BackendType(backend),
+                    faster_whisper_custom_model_path=faster_whisper_custom_model_path,
+                    whisper_tensorrt_path=whisper_tensorrt_path,
+                    trt_multilingual=trt_multilingual,
+                    model_name="large-v3-turbo"
+                )
             else:
-                logging.info("Single model mode currently only works with custom models.")
+                logging.info("Single model mode currently only works with custom models or faster_whisper backend.")
         if not BackendType.is_valid(backend):
             raise ValueError(f"{backend} is not a valid backend type. Choose backend from {BackendType.valid_types()}")
         with serve(
@@ -414,7 +497,7 @@ class ServeClientBase(object):
         self.websocket = websocket
         self.frames = b""
         self.timestamp_offset = 0.0
-        self.frames_np = None
+        self.frames_np = np.array([], dtype=np.float32)
         self.frames_offset = 0.0
         self.text = []
         self.current_out = ''
@@ -459,7 +542,7 @@ class ServeClientBase(object):
 
         """
         self.lock.acquire()
-        if self.frames_np is not None and self.frames_np.shape[0] > 45*self.RATE:
+        if self.frames_np.shape[0] > 45*self.RATE:
             self.frames_offset += 30.0
             self.frames_np = self.frames_np[int(30*self.RATE):]
             # check timestamp offset(should be >= self.frame_offset)
@@ -467,7 +550,7 @@ class ServeClientBase(object):
             # and is less than frame_offset
             if self.timestamp_offset < self.frames_offset:
                 self.timestamp_offset = self.frames_offset
-        if self.frames_np is None:
+        if self.frames_np.shape[0] == 0:
             self.frames_np = frame_np.copy()
         else:
             self.frames_np = np.concatenate((self.frames_np, frame_np), axis=0)
@@ -552,12 +635,12 @@ class ServeClientBase(object):
             segments (list): A list of transcription segments to be sent to the client.
         """
         try:
-            self.websocket.send(
-                json.dumps({
-                    "uid": self.client_uid,
-                    "segments": segments,
-                })
-            )
+            response = {
+                "uid": self.client_uid,
+                "segments": segments,
+            }
+            logging.info(f"Sending response to client {self.client_uid}: {json.dumps(response, indent=2)}")
+            self.websocket.send(json.dumps(response))
         except Exception as e:
             logging.error(f"[ERROR]: Sending data to client: {e}")
 
@@ -615,11 +698,13 @@ class ServeClientTensorRT(ServeClientBase):
         self.eos = False
 
         if single_model:
-            if ServeClientTensorRT.SINGLE_MODEL is None:
+            if ServeClientTensorRT.SINGLE_MODEL is not None:
+                logging.info("Using preloaded TensorRT model")
+                self.transcriber = ServeClientTensorRT.SINGLE_MODEL
+            else:
+                logging.info("TensorRT single model was requested but not preloaded. Creating model...")
                 self.create_model(model, multilingual)
                 ServeClientTensorRT.SINGLE_MODEL = self.transcriber
-            else:
-                self.transcriber = ServeClientTensorRT.SINGLE_MODEL
         else:
             self.create_model(model, multilingual)
 
@@ -637,12 +722,15 @@ class ServeClientTensorRT(ServeClientBase):
         """
         Instantiates a new model, sets it as the transcriber and does warmup if desired.
         """
+        # Ensure language is never None
+        language = self.language if self.language is not None else "en"
+        
         self.transcriber = WhisperTRTLLM(
             model,
             assets_dir="assets",
             device="cuda",
             is_multilingual=multilingual,
-            language=self.language,
+            language=language,
             task=self.task
         )
         if warmup:
@@ -743,7 +831,7 @@ class ServeClientTensorRT(ServeClientBase):
                 logging.info("Exiting speech to text thread")
                 break
 
-            if self.frames_np is None:
+            if self.frames_np.shape[0] == 0:
                 time.sleep(0.02)    # wait for any audio to arrive
                 continue
 
@@ -767,7 +855,7 @@ class ServeClientFasterWhisper(ServeClientBase):
     SINGLE_MODEL = None
     SINGLE_MODEL_LOCK = threading.Lock()
 
-    def __init__(self, websocket, task="transcribe", device=None, language=None, client_uid=None, model="small.en",
+    def __init__(self, websocket, task="transcribe", device=None, language=None, client_uid=None, model="large-v3-turbo",
                  initial_prompt=None, vad_parameters=None, use_vad=True, single_model=False):
         """
         Initialize a ServeClient instance.
@@ -814,12 +902,15 @@ class ServeClientFasterWhisper(ServeClientBase):
         logging.info(f"Using Device={device} with precision {self.compute_type}")
     
         try:
+            # Check if we should use the preloaded model
             if single_model:
-                if ServeClientFasterWhisper.SINGLE_MODEL is None:
+                if ServeClientFasterWhisper.SINGLE_MODEL is not None:
+                    logging.info("Using preloaded single model")
+                    self.transcriber = ServeClientFasterWhisper.SINGLE_MODEL
+                else:
+                    logging.info("Single model was requested but not preloaded. Creating model...")
                     self.create_model(device)
                     ServeClientFasterWhisper.SINGLE_MODEL = self.transcriber
-                else:
-                    self.transcriber = ServeClientFasterWhisper.SINGLE_MODEL
             else:
                 self.create_model(device)
         except Exception as e:
@@ -998,7 +1089,7 @@ class ServeClientFasterWhisper(ServeClientBase):
                 logging.info("Exiting speech to text thread")
                 break
 
-            if self.frames_np is None:
+            if self.frames_np.shape[0] == 0:
                 continue
 
             self.clip_audio_if_no_valid_segment()
@@ -1120,7 +1211,6 @@ class ServeClientFasterWhisper(ServeClientBase):
                     ))
             self.current_out = ''
             offset = min(duration, self.end_time_for_same_output)
-            self.same_output_count = 0
             last_segment = None
             self.end_time_for_same_output = None
         else:
