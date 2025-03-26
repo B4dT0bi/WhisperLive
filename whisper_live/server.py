@@ -539,31 +539,8 @@ class ServeClientBase(object):
         raise NotImplementedError
 
     def handle_transcription_output(self, transcription_result, audio_duration):
-        """
-        Handle the transcription output, updating the transcript and sending data to the client.
-        
-        Args:
-            transcription_result: The result from transcription (can be segments or text)
-            audio_duration (float): Duration of the transcribed audio chunk.
-        """
         raise NotImplementedError
         
-    def update_timestamp_offset(self, segment, duration):
-        """
-        Update timestamp offset and transcript.
-
-        Args:
-            segment (str): Last transcribed audio from the whisper model.
-            duration (float): Duration of the last audio chunk.
-        """
-        if not len(self.transcript):
-            self.transcript.append({"text": segment + " ", "confidence": 0.0})  # TensorRT doesn't provide confidence directly
-        elif self.transcript[-1]["text"].strip() != segment:
-            self.transcript.append({"text": segment + " ", "confidence": 0.0})  # TensorRT doesn't provide confidence directly
-        
-        with self.lock:
-            self.timestamp_offset += duration
-
     def add_frames(self, frame_np):
         """
         Add audio frames to the ongoing audio stream buffer.
@@ -641,24 +618,14 @@ class ServeClientBase(object):
             list: A list of transcribed text segments to be sent to the client.
         """
         segments = []
-        
-        # Get recent segments from transcript that haven't been sent yet or aren't completed
-        for segment in self.transcript:
-            segment_id = f"{segment.get('start', '')}-{segment.get('end', '')}"
-            if not segment.get('completed', False) or segment_id not in self.sent_completed_segments:
-                segments.append(segment)
-                # Mark completed segments as sent
-                if segment.get('completed', False):
-                    self.sent_completed_segments.add(segment_id)
-        
-        # Add the latest incomplete segment if provided
+        if len(self.transcript) >= self.send_last_n_segments:
+            segments = self.transcript[-self.send_last_n_segments:].copy()
+        else:
+            segments = self.transcript.copy()
+       
         if last_segment is not None:
-            segments.append(last_segment)
-            
-        # Apply the limit to avoid sending too many segments
-        if len(segments) > self.send_last_n_segments:
-            segments = segments[-self.send_last_n_segments:]
-            
+            segments = segments + [last_segment]
+
         return segments
 
     def get_audio_chunk_duration(self, input_bytes):
@@ -679,17 +646,38 @@ class ServeClientBase(object):
 
         This method formats the transcription segments into a JSON object and attempts to send
         this object to the client. If an error occurs during the send operation, it logs the error.
+        
+        Only segments that haven't been sent before will be included in the response.
+        Completed segments are tracked to avoid duplicate sending.
 
-        Returns:
+        Args:
             segments (list): A list of transcription segments to be sent to the client.
         """
         try:
-            response = {
-                "uid": self.client_uid,
-                "segments": segments,
-            }
-            logging.info(f"Sending response to client {self.client_uid}: {json.dumps(response, indent=2)}")
-            self.websocket.send(json.dumps(response))
+            # Filter out completed segments that have already been sent
+            filtered_segments = []
+            logging.info(f"Segments before filtering: {segments}")
+            for segment in segments:
+                # Create a unique ID for the segment based on its content and timestamps
+                segment_id = None
+                if segment.get('completed', False) and 'text' in segment and 'start' in segment and 'end' in segment:
+                    segment_id = f"{segment['text']}_{segment['start']}_{segment['end']}"
+                    
+                # Only include segments that are not completed or haven't been sent before
+                if not segment.get('completed', False) or segment_id not in self.sent_completed_segments:
+                    filtered_segments.append(segment)
+                    # Track completed segments to avoid sending them again
+                    if segment.get('completed', False) and segment_id is not None:
+                        self.sent_completed_segments.add(segment_id)
+            
+            # Only send the response if there are segments to send
+            if filtered_segments:
+                response = {
+                    "uid": self.client_uid,
+                    "segments": filtered_segments,
+                }
+                logging.info(f"Sending response to client {self.client_uid}: {json.dumps(response, indent=2)}")
+                self.websocket.send(json.dumps(response))
         except Exception as e:
             logging.error(f"[ERROR]: Sending data to client: {e}")
 
@@ -850,6 +838,21 @@ class ServeClientTensorRT(ServeClientBase):
             ServeClientTensorRT.SINGLE_MODEL_LOCK.release()
         if last_segment:
             self.handle_transcription_output(last_segment, duration)
+
+    def update_timestamp_offset(self, last_segment, duration):
+        """
+        Update timestamp offset and transcript.
+        Args:
+            last_segment (str): Last transcribed audio from the whisper model.
+            duration (float): Duration of the last audio chunk.
+        """
+        if not len(self.transcript):
+            self.transcript.append({"text": last_segment + " "})
+        elif self.transcript[-1]["text"].strip() != last_segment:
+            self.transcript.append({"text": last_segment + " "})
+
+        with self.lock:
+            self.timestamp_offset += duration
 
     def speech_to_text(self):
         """
@@ -1316,6 +1319,7 @@ class ServeClientFasterWhisper(ServeClientBase):
                     ))
             self.current_out = ''
             offset = min(duration, self.end_time_for_same_output)
+            self.same_output_count = 0
             last_segment = None
             self.end_time_for_same_output = None
         else:
