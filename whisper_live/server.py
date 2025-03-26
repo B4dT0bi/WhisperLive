@@ -646,17 +646,38 @@ class ServeClientBase(object):
 
         This method formats the transcription segments into a JSON object and attempts to send
         this object to the client. If an error occurs during the send operation, it logs the error.
+        
+        Only segments that haven't been sent before will be included in the response.
+        Completed segments are tracked to avoid duplicate sending.
 
-        Returns:
+        Args:
             segments (list): A list of transcription segments to be sent to the client.
         """
         try:
-            response = {
-                "uid": self.client_uid,
-                "segments": segments,
-            }
-            logging.info(f"Sending response to client {self.client_uid}: {json.dumps(response, indent=2)}")
-            self.websocket.send(json.dumps(response))
+            # Filter out completed segments that have already been sent
+            filtered_segments = []
+            logging.info(f"Segments before filtering: {segments}")
+            for segment in segments:
+                # Create a unique ID for the segment based on its content and timestamps
+                segment_id = None
+                if segment.get('completed', False) and 'text' in segment and 'start' in segment and 'end' in segment:
+                    segment_id = f"{segment['text']}_{segment['start']}_{segment['end']}"
+                    
+                # Only include segments that are not completed or haven't been sent before
+                if not segment.get('completed', False) or segment_id not in self.sent_completed_segments:
+                    filtered_segments.append(segment)
+                    # Track completed segments to avoid sending them again
+                    if segment.get('completed', False) and segment_id is not None:
+                        self.sent_completed_segments.add(segment_id)
+            
+            # Only send the response if there are segments to send
+            if filtered_segments:
+                response = {
+                    "uid": self.client_uid,
+                    "segments": filtered_segments,
+                }
+                logging.info(f"Sending response to client {self.client_uid}: {json.dumps(response, indent=2)}")
+                self.websocket.send(json.dumps(response))
         except Exception as e:
             logging.error(f"[ERROR]: Sending data to client: {e}")
 
