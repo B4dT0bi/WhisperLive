@@ -48,6 +48,8 @@ class Client:
             max_clients (int, optional): Maximum number of client connections allowed. Default is 4.
             max_connection_time (int, optional): Maximum allowed connection time in seconds. Default is 600.
         """
+        self.error_message = None
+        self.server_backend = None
         self.recording = False
         self.task = "transcribe"
         self.uid = str(uuid.uuid4())
@@ -64,6 +66,14 @@ class Client:
         self.log_transcription = log_transcription
         self.max_clients = max_clients
         self.max_connection_time = max_connection_time
+        self.callbacks = {
+            "handle_status_messages": None,
+            "process_segments": None,
+            "on_error": None,
+            "on_close": None,
+            "server_disconnect_overtime": None,
+            "server_ready": None,
+        }
 
         if translate:
             self.task = "translate"
@@ -95,6 +105,17 @@ class Client:
         self.transcript = []
         logger.info("* recording")
 
+    def register_callback(self, event_name, callback):
+        if event_name in self.callbacks:
+            self.callbacks[event_name] = callback
+        else:
+            logger.warning(f"Unknown callback event: {event_name}")
+
+    def _invoke_callback_async(self, name, *args, **kwargs):
+        callback = self.callbacks.get(name)
+        if callback:
+            threading.Thread(target=callback, args=args, kwargs=kwargs, daemon=True).start()
+
     def handle_status_messages(self, message_data):
         """Handles server status messages."""
         status = message_data["status"]
@@ -106,6 +127,7 @@ class Client:
             self.server_error = True
         elif status == "WARNING":
             logger.warning(f"Message from Server: {message_data['message']}")
+        self._invoke_callback_async("handle_status_messages", message_data)
 
     def process_segments(self, segments):
         """Processes transcript segments."""
@@ -129,6 +151,7 @@ class Client:
             text = text[-6:]
             utils.clear_screen()
             utils.print_transcript(text)
+        self._invoke_callback_async("process_segments", segments)
 
     def on_message(self, ws, message):
         """
@@ -156,12 +179,14 @@ class Client:
         if "message" in message.keys() and message["message"] == "DISCONNECT":
             logger.info("Server disconnected due to overtime.")
             self.recording = False
+            self._invoke_callback_async("server_disconnect_overtime")
 
         if "message" in message.keys() and message["message"] == "SERVER_READY":
             self.last_response_received = time.time()
             self.recording = True
             self.server_backend = message["backend"]
             logger.info(f"Server Running with backend {self.server_backend}")
+            self._invoke_callback_async("server_ready")
             return
 
         if "language" in message.keys():
@@ -179,11 +204,13 @@ class Client:
         logger.error(f"WebSocket Error: {error}")
         self.server_error = True
         self.error_message = error
+        self._invoke_callback_async("on_error", ws, error)
 
     def on_close(self, ws, close_status_code, close_msg):
         logger.info(f"Websocket connection closed: {close_status_code}: {close_msg}")
         self.recording = False
         self.waiting = False
+        self._invoke_callback_async("on_close", ws, close_status_code, close_msg)
 
     def on_open(self, ws):
         """

@@ -1,5 +1,7 @@
 import argparse
 
+from loguru import logger
+
 from whisper_live.transcription_client import TranscriptionClient
 
 
@@ -38,8 +40,11 @@ def main():
         mute_audio_playback=args.mute_audio_playback,
         pyaudio_input_device_id=args.pyaudio_input_device_id
     )
-
+    transcription_client.register_callback("process_segments", my_segment_callback)
     transcription_client()
+
+def my_segment_callback(segments):
+    logger.info(f"Received segments:{segments}")
 
 if __name__ == "__main__":
     main()

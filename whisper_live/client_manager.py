@@ -3,14 +3,14 @@ import time
 from loguru import logger
 
 class ClientManager:
-    def __init__(self, max_clients=4, max_connection_time=600):
+    def __init__(self, max_clients=4, max_connection_time=6000):
         """
         Initializes the ClientManager with specified limits on client connections and connection durations.
 
         Args:
             max_clients (int, optional): The maximum number of simultaneous client connections allowed. Defaults to 4.
             max_connection_time (int, optional): The maximum duration (in seconds) a client can stay connected. Defaults
-                                                 to 600 seconds (10 minutes).
+                                                 to 6000 seconds (100 minutes).
         """
         self.clients = {}
         self.start_times = {}

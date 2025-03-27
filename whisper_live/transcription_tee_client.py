@@ -71,14 +71,8 @@ class TranscriptionTeeClient:
             source is not None for source in [audio, rtsp_url, hls_url]
         ) <= 1, 'You must provide only one selected source'
 
-        logger.info("Waiting for server ready ...")
-        for client in self.clients:
-            while not client.recording:
-                if client.waiting or client.server_error:
-                    self.close_all_clients()
-                    return
+        self.wait_for_server_ready()
 
-        logger.info("Server Ready!")
         if hls_url is not None:
             self.process_hls_stream(hls_url, save_file)
         elif audio is not None:
@@ -88,6 +82,23 @@ class TranscriptionTeeClient:
             self.process_rtsp_stream(rtsp_url)
         else:
             self.record()
+
+    def register_callback(self, event_name, callback):
+        for client in self.clients:
+            client.register_callback(event_name, callback)
+
+    def wait_for_server_ready(self):
+        """
+        Wait for the server to be ready to receive audio data.
+        """
+        logger.info("Waiting for server ready ...")
+        for client in self.clients:
+            while not client.recording:
+                if client.waiting or client.server_error:
+                    self.close_all_clients()
+                    return
+
+        logger.info("Server Ready!")
 
     def close_all_clients(self):
         """Closes all client websockets."""
