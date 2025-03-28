@@ -51,7 +51,6 @@ class ServeClientFasterWhisper(ServeClientBase):
         self.lock = threading.Lock()
         self.transcript = []
         self.text = []
-        self.no_speech_thresh = 0.6
         self.prev_out = ''
         self.current_out = ''
         self.current_segment_avg_logprob = None  # Store the latest segment's avg_logprob
@@ -67,7 +66,7 @@ class ServeClientFasterWhisper(ServeClientBase):
         self.language = "en" if self.model_size_or_path.endswith("en") else language
         self.initial_prompt = initial_prompt
         self.vad_parameters = vad_parameters or {"onset": 0.5}
-        self.no_speech_thresh = 0.45
+        self.no_speech_thresh = 0.3
         self.same_output_threshold = 10
         self.end_time_for_same_output = None
 
@@ -435,6 +434,7 @@ class ServeClientFasterWhisper(ServeClientBase):
                     ))
             self.current_out = ''
             offset = min(duration, self.end_time_for_same_output)
+            self.same_output_count = 0
             last_segment = None
             self.end_time_for_same_output = None
         else:
